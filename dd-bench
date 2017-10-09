@@ -1,0 +1,132 @@
+#!/bin/bash
+
+set -e
+
+shopt -s extglob
+
+script_path="${0%/*}"
+
+warn() { echo "$@" >&2; }
+die()  { warn "$@"; exit 3; }
+
+show_help() {
+  cat <<EOF
+${0##*/} - Test/Benchmark Disk I/O with dd(1).
+
+  o   -   target file/device that dd will write to/read from.
+  d   -   direction of test i.e. read or write.
+  i   -   dd poll interval.
+  a   -   min. block size.
+  z   -   max. block size.
+  s   -   file size of target file. only makes sense when direction is write.
+  x   -   min. and max. block sizes are the same.
+  m   -   block size multiplier.
+  t   -   time to pause between runs.
+  e   -   dd(1) opts that can be passed verbatim to dd.
+  n   -   dry run. only print commands that will be executed.
+  h   -   show this help menu.
+EOF
+}
+
+while getopts ":m:a:z:o:i:d:s:e:t:nxh" opt; do
+
+  case "$opt" in
+    a) min_block_size="$OPTARG"  ;;
+    z) max_block_size="$OPTARG"  ;;
+    m) block_size_multiplier="$OPTARG"  ;;
+    o) out_file="$OPTARG"  ;;
+    s) out_file_size="${OPTARG%%.*}"  ;;
+    i) dd_poll_interval="$OPTARG"  ;;
+    e) dd_opts="$OPTARG" ;;
+    d) direction="$OPTARG"
+      if [[ $direction != @(read|write) ]]; then die "Invalid direction '$direction'"; fi
+      ;;
+    n) dry_run=1 ;;
+    x) single_block_size=1 ;;
+    t) time_to_pause="$OPTARG" ;;
+    h) show_help; exit 2 ;;
+    *) die "Option '$OPTARG' unimplemented" ;;
+    :) die "Option -$OPTARG requires an argument" ;;
+  esac
+
+done
+
+min_block_size="${min_block_size:-$((4*1024))}"    # 4KiB
+if (( single_block_size == 1 )); then
+  max_block_size="$min_block_size"
+else
+  max_block_size="${max_block_size:-$((1*1024**3))}" # 1GiB
+fi
+
+block_size_multiplier="${block_size_multiplier:-2}"
+(( block_size_multiplier == 1 )) && \
+  die "Invalid block size multiplier '$block_size_multiplier'"
+
+dd_poll_interval="${dd_poll_interval:-6.4}"
+dd_opts_default='iflag=fullblock oflag=nocache'
+dd_opts="${dd_opts:-"$dd_opts_default"}"
+out_file="${out_file}"; [[ -z $out_file ]] && die "No target file specified."
+out_file_size="${out_file_size:-$((8*1024**3))}"
+time_to_pause="${time_to_pause:-10}"
+dry_run="${dry_run:-0}"
+direction="${direction:-write}"
+
+if [[ $direction = read ]]; then    if="$out_file"; of=/dev/null;
+  out_file_size_t="$(stat -c %s "$out_file")"
+  if (( out_file_size_t != 0 )); then
+    out_file_size="$out_file_size_t"
+  fi
+elif [[ $direction = write ]]; then if=/dev/zero;   of="$out_file";
+fi
+
+
+for (( bs=min_block_size; bs<=max_block_size+1; bs*=block_size_multiplier )); do
+    count="$((out_file_size/bs))"
+
+    if (( dry_run == 1 )); then
+      echo '  'dd if="$if" of="$of" bs="$bs" count="$count" "$dd_opts"
+    elif (( dry_run == 0 )); then
+      temp_script="$(mktemp)"
+
+      cat >"$temp_script" <<'EOF'
+#!/bin/bash
+
+set -eu
+TIMEFORMAT=$'time: real %R\tuser %U\tsys %S\tcpu %P'
+
+warn() { echo "$@" >&2; }
+die()  { warn "$@"; exit 3; }
+
+if="$1"; of="$2"; bs="$3"; count="$4"; dd_poll_interval="$5"; dd_opts="$6"; 
+
+echo dd if="$if" of="$of" bs="$bs" count="$count" $dd_opts 
+
+trap 'warn "Terminating PID : $dd_pid"; kill $dd_pid' INT
+
+time {
+  dd if="$if" of="$of" bs="$bs" count="$count" $dd_opts & dd_pid=$!
+  sleep 1.6;
+
+  out_filesystem=$(df --no-sync -PT "$of" | awk '$1 !~ /Filesystem/{print $1}')
+
+  while kill -0 "$dd_pid" &> /dev/null; do
+    top -b -n 1 | awk 'BEGIN{RS="\n\n"}/Tasks/'
+    kill -USR1 "$dd_pid" &>  /dev/null
+    echo
+    sleep "$dd_poll_interval"
+  done
+} 
+EOF
+      chmod +x "$temp_script"
+      log_file="if=$if of=$of bs=$bs count=$count $dd_opts.log"
+      log_file="$(tr '\ \/' '|_' <<<$log_file)"
+      script -c "$temp_script $if $of $bs $count $dd_poll_interval '$dd_opts'" "$log_file"
+      rm -f "$temp_script"
+      echo sleep "$time_to_pause"
+      sync
+      sleep "$time_to_pause"
+
+      printf "\n"
+    fi
+
+done
